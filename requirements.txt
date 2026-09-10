@@ -1,0 +1,6 @@
+pywin32
+requests
+python-dotenv
+beautifulsoup4
+pandas
+lxml
