@@ -3,8 +3,8 @@ import os
 import sys
 import argparse
 import logging
+import re
 import requests
-from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -45,23 +45,33 @@ class ConfluenceClient:
         })
 
     def get_page_storage_html(self, page_id: str) -> str:
-        url = f"{self.cfg.confluence_base_url}/rest/api/content/{self.cfg.page_id}"
+        url = f"{self.cfg.confluence_base_url}/rest/api/content/{page_id}"
         params = {"expand":"body.storage,version,title"}
         resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        log.info(f"Fetched page {data.get("title")} (id={self.cfg.page_id}, version={data.get("version", {}).get("number")})")
+        log.info(
+            "Fetched page %s (id=%s, version=%s)",
+            data.get("title"),
+            page_id,
+            data.get("version", {}).get("number"),
+        )
         return data["body"]["storage"]["value"]
 
 class JiraClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(cfg.jira_email, cfg.jira_token)
-        self.session.headers.update({"Accept":"application/json"})
+        self.session.headers.update({
+            "Authorization": f"Bearer {cfg.jira_token}",
+            "Accept":"application/json"
+        })
 
     def search(self, jql: str, fields=None, max_results: int=200) -> pd.DataFrame:
-        fields = fields or ['key', 'summary', 'status', 'assignee', 'priority', 'updated']
+        fields = fields or [
+            "key", "summary", "status", "assignee", "priority", "updated",
+            "issuetype", "duedate",
+        ]
         url = f"{self.cfg.jira_base_url}/rest/api/2/search"
         all_issues = []
         start_at = 0
@@ -95,7 +105,9 @@ class JiraClient:
                 "status": (f.get("status") or {}).get("name"),
                 "assignee": (f.get("assignee") or {}).get("displayName"),
                 "priority": (f.get("priority") or {}).get("name"),
-                "updated": f.get("updated")
+                "updated": f.get("updated"),
+                "issue_type": (f.get("issuetype") or {}).get("name"),
+                "due_date": f.get("duedate"),
             })
         return pd.DataFrame(rows)
 
@@ -118,7 +130,8 @@ def extract_jira_macros(storage_html: str) -> list[dict]:
         params={}
         for param in macro.find_all("ac:parameter"):
             name = param.get("ac:name")
-            param[name] = param.get_text(strip=True)
+            if name:
+                params[name] = param.get_text(strip=True)
         macros.append(params)
     log.info(f"Found {len(macros)} Jira macro(s) in storage format")
     return macros
@@ -132,6 +145,53 @@ def build_jql_for_macro(params: dict) -> str | None:
         filter_id = params["filter"].replace("filter-", "")
         return f"filter = {filter_id}"
     return None
+
+
+JIRA_KEY_PATTERN = re.compile(r"\b[A-Z][A-Z0-9_]*-\d{5}\b", re.IGNORECASE)
+
+
+def extract_jira_keys(value) -> list[str]:
+    if pd.isna(value):
+        return []
+    return [key.upper() for key in JIRA_KEY_PATTERN.findall(str(value))]
+
+
+def find_test_plan_keys(tables: list[pd.DataFrame]) -> list[str]:
+    keys = []
+    for table_number, df in enumerate(tables, start=1):
+        test_plan_columns = [
+            column for column in df.columns
+            if str(column).strip().casefold() == "test plan"
+        ]
+        for column in test_plan_columns:
+            for value in df[column]:
+                keys.extend(extract_jira_keys(value))
+        if test_plan_columns:
+            log.info("Read Test Plan key(s) from static table %s", table_number)
+
+    # dict preserves encounter order while removing duplicates.
+    return list(dict.fromkeys(keys))
+
+
+def fetch_test_executions_for_plans(jira: JiraClient, test_plan_keys: list[str]) -> pd.DataFrame:
+    result_frames = []
+    for test_plan_key in test_plan_keys:
+        jql = (
+            'issuetype = "Xray Test Execution" '
+            f'AND "Test Plan" = "{test_plan_key}" '
+            "ORDER BY key"
+        )
+        log.info("Fetching Test Execution issues for Test Plan %s", test_plan_key)
+        df = jira.search(jql)
+        if df.empty:
+            log.warning("No Test Execution issues found for Test Plan %s", test_plan_key)
+            continue
+        df.insert(0, "test_plan_key", test_plan_key)
+        result_frames.append(df)
+
+    if not result_frames:
+        return pd.DataFrame()
+    return pd.concat(result_frames, ignore_index=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape a Confluence page including Jira tables")
@@ -158,6 +218,20 @@ def main():
         df.to_csv(out_path, index=False)
         log.info(f"Wrote {out_path} ({len(df)} rows)")
 
+    # Jira macros in storage HTML are not rendered by pandas.  The static table
+    # still contains its parent Test Plan key, which is enough to retrieve the
+    # linked Xray Test Execution issues through Jira's REST API.
+    test_plan_keys = find_test_plan_keys(static_tables)
+    if test_plan_keys:
+        log.info("Found %s unique Test Plan key(s): %s", len(test_plan_keys), ", ".join(test_plan_keys))
+        test_executions = fetch_test_executions_for_plans(jira, test_plan_keys)
+        if not test_executions.empty:
+            out_path = os.path.join(args.out_dir, "test_executions.csv")
+            test_executions.to_csv(out_path, index=False)
+            log.info("Wrote %s (%s rows)", out_path, len(test_executions))
+    else:
+        log.warning("No Jira Test Plan keys were found in a 'Test Plan' column")
+
     jira_macros = extract_jira_macros(storage_html)
     for i, params in enumerate(jira_macros, start=1):
         jql = build_jql_for_macro(params)
@@ -175,8 +249,8 @@ def main():
         df.to_csv(out_path, index=False)
         log.info(f"Wrote {out_path} ({len(df)} rows)")
 
-        if not static_tables and not jira_macros:
-            log.warning("No Jira macros or Confluence tables present")
+    if not static_tables and not jira_macros:
+        log.warning("No Jira macros or Confluence tables present")
 
 if __name__ == "__main__":
     main()
