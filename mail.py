@@ -15,7 +15,7 @@ if not OUTPUT_DIR.exists():
     OUTPUT_DIR = SCRIPT_DIR / "confluence_ouput"
 
 RECIPIENTS = [
-    "VenkataRamanaKumar.Rajanala@silabs.com",
+    # "VenkataRamanaKumar.Rajanala@silabs.com",
     "Gautham.Sharma@silabs.com",
 ]
 CC_RECIPIENTS = []
@@ -116,13 +116,12 @@ def coverage(row):
 
 
 def is_visible_execution(row):
-    technology = (row.get("technology") or "").casefold()
-    test_area = (row.get("test_area") or "").strip().casefold()
-    return "wlan" in technology or test_area == "functionality"
+    """Show executions containing at least one testcase retained by the scraper."""
+    return number(row, "total_testcases") > 0
 
 
 def execution_table(rows, metadata, include_board):
-    headings = ["Test_plan"]
+    headings = ["Test plan"]
     if include_board:
         headings.append("Board Details")
     headings += [

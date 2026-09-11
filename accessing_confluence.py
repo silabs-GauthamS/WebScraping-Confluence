@@ -19,6 +19,9 @@ logging.basicConfig(
 
 log = logging.getLogger("confluence_scraper")
 
+TESTCASE_TECHNOLOGY_FIELD = "customfield_22640"
+TESTCASE_TEST_AREA_FIELD = "customfield_33578"
+
 class Config:
     def __init__(self):
         load_dotenv()
@@ -88,7 +91,8 @@ class JiraClient:
             "issuetype", "duedate", 
             "customfield_34841",  # Test Area
             "customfield_34940",  # Technology
-            "customfield_34442"   # Compiler
+            "customfield_34442",  # Compiler
+            # "customfield_34640",  # Job type
         ]
         url = f"{self.cfg.jira_base_url}/rest/api/2/search"
         all_issues = []
@@ -129,8 +133,42 @@ class JiraClient:
                 "test_area": jira_field_value(f.get("customfield_34841")),
                 "technology": jira_field_value(f.get("customfield_34940")),
                 "compiler": jira_field_value(f.get("customfield_34442")),
+                # "job_type": jira_field_value(f.get("customfield_34640"))
             })
         return pd.DataFrame(rows)
+
+    def get_testcase_filter_fields(self, test_keys: list[str]) -> dict[str, dict]:
+        """Return raw Technology and Test Area values for the requested Test issues."""
+        metadata = {}
+        unique_keys = list(dict.fromkeys(key for key in test_keys if key))
+
+        # Keep each JQL request reasonably small while still using Jira pagination.
+        for offset in range(0, len(unique_keys), 100):
+            key_batch = unique_keys[offset:offset + 100]
+            quoted_keys = ", ".join(f'"{key}"' for key in key_batch)
+            payload = {
+                "jql": f"key in ({quoted_keys})",
+                "startAt": 0,
+                "maxResults": len(key_batch),
+                "fields": [TESTCASE_TEST_AREA_FIELD, TESTCASE_TECHNOLOGY_FIELD],
+            }
+            url = f"{self.cfg.jira_base_url}/rest/api/2/search"
+            resp = self.session.post(url, json=payload, timeout=30)
+            if not resp.ok:
+                raise XrayError(
+                    "Could not retrieve testcase Technology/Test Area fields: "
+                    f"HTTP {resp.status_code}: {resp.text[:300]}"
+                )
+
+            for issue in resp.json().get("issues", []):
+                fields = issue.get("fields", {})
+                issue_key = str(issue.get("key") or "").strip().upper()
+                metadata[issue_key] = {
+                    "test_area": fields.get(TESTCASE_TEST_AREA_FIELD),
+                    "technology": fields.get(TESTCASE_TECHNOLOGY_FIELD),
+                }
+
+        return metadata
 
     def _xray_get(self, path: str, params: dict | None = None):
         """GET an Xray Server/Data Center REST resource using the Jira PAT."""
@@ -270,6 +308,42 @@ def jira_field_value(value):
 
     return value
 
+
+def jira_field_has_exact_value(value, expected: str) -> bool:
+    """Match one Jira option exactly, including inside a multi-select field."""
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return any(jira_field_has_exact_value(item, expected) for item in value)
+    if isinstance(value, dict):
+        option = (
+            value.get("value")
+            or value.get("name")
+            or value.get("displayName")
+            or value.get("key")
+        )
+        return jira_field_has_exact_value(option, expected)
+    expected = expected.casefold()
+    return any(
+        option.strip().casefold() == expected
+        for option in re.split(r"[,;]", str(value))
+    )
+
+
+def xray_test_key(test: dict) -> str | None:
+    """Extract a Jira Test key from the response shapes used by Xray versions."""
+    for field in ("key", "testKey", "testIssueKey"):
+        if test.get(field):
+            return str(test[field]).strip().upper()
+
+    for field in ("test", "issue"):
+        nested = test.get(field)
+        if isinstance(nested, dict):
+            for key_field in ("key", "testKey", "testIssueKey"):
+                if nested.get(key_field):
+                    return str(nested[key_field]).strip().upper()
+    return None
+
 def extract_static_tables(storage_html: str) -> list[pd.DataFrame]:
     soup = BeautifulSoup(storage_html, "lxml")
     tables = []
@@ -343,14 +417,74 @@ STATUS_COLUMN_MAP = {
     "N/A": "not_applicable",
 }
 
+FILTER_TECHNOLOGY = "WLAN"
+FILTER_TEST_AREA = "FUNCTIONAL"
+
 
 def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
-    """Aggregate Xray's detailed testcase response into one execution summary."""
+    """Aggregate matching WLAN/Functionality testcases into one execution summary."""
     tests = jira.get_xray_execution_tests(execution_key)
+    test_keys = [key for test in tests if (key := xray_test_key(test))]
+    testcase_metadata = jira.get_testcase_filter_fields(test_keys)
+    filtered_tests = []
+
+    log.info(
+        "Test Execution %s: extracted %s testcase keys and retrieved Jira fields for %s",
+        execution_key,
+        len(test_keys),
+        len(testcase_metadata),
+    )
+
+    if tests and not test_keys:
+        log.warning(
+            "No Jira testcase keys could be extracted for %s. Sample Xray record: %s",
+            execution_key,
+            json.dumps(tests[0], default=str)[:1000],
+        )
+    elif test_keys and not testcase_metadata:
+        log.warning(
+            "Jira returned no testcase field records for %s. Sample keys: %s",
+            execution_key,
+            ", ".join(test_keys[:5]),
+        )
+
+    for test in tests:
+        test_key = xray_test_key(test)
+        fields = testcase_metadata.get(test_key, {})
+        if (
+            jira_field_has_exact_value(fields.get("technology"), FILTER_TECHNOLOGY)
+            and jira_field_has_exact_value(fields.get("test_area"), FILTER_TEST_AREA)
+        ):
+            filtered_tests.append(test)
+
+    if tests and not filtered_tests and testcase_metadata:
+        observed_values = [
+            {
+                "key": key,
+                "technology": JiraClient._value(fields.get("technology")),
+                "test_area": JiraClient._value(fields.get("test_area")),
+            }
+            for key, fields in list(testcase_metadata.items())[:10]
+        ]
+        log.warning(
+            "No testcase matched the filter for %s. Sample Jira field values: %s",
+            execution_key,
+            json.dumps(observed_values, default=str),
+        )
+
+    log.info(
+        "Test Execution %s: retained %s of %s testcases after testcase-level "
+        "Technology=%s and Test Area=%s filtering",
+        execution_key,
+        len(filtered_tests),
+        len(tests),
+        FILTER_TECHNOLOGY,
+        FILTER_TEST_AREA,
+    )
     counts = Counter()
     defects = set()
 
-    for test in tests:
+    for test in filtered_tests:
         status = str(JiraClient._value(test.get("status")) or "Unknown").strip()
         counts[status] += 1
 
@@ -362,7 +496,7 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
 
     row = {
         "key": execution_key,
-        "total_testcases": len(tests),
+        "total_testcases": len(filtered_tests),
         "passed": 0,
         "failed": 0,
         "retest": 0,
