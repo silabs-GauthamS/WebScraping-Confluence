@@ -94,8 +94,6 @@ def execution_parts(summary, compiler):
         re.IGNORECASE,
     )
     if not match:
-        # Missing value: test-plan/board extraction needs a summary following
-        # te-<release>-917-<test plan>-<compiler>-<board>.
         return text or "-", "-"
 
     test_plan = match.group("test_plan").strip()
@@ -220,7 +218,7 @@ def build_report_html(soc_rows, ncp_rows, soc_metadata, ncp_metadata):
     return f"""<!DOCTYPE html>
 <html>
 <body style="margin:0;padding:20px;background:#f4f6f8;color:#172b4d;font-family:Arial,sans-serif;font-size:14px;">
-  <div style="max-width:1400px;margin:auto;background:#ffffff;border:1px solid #dfe1e6;padding:24px;">
+  <div style="max-width:1400px;margin:auto;border:1px solid #dfe1e6;padding:24px;">
     <p>Hi Everyone,</p>
     <p>Please find the below complete Execution status of <strong>{escape(BUILD_NAME)}</strong>
        build [{escape(REPORT_PERIOD)}].</p>
