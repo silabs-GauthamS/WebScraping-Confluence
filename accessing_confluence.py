@@ -85,7 +85,10 @@ class JiraClient:
     def search(self, jql: str, fields=None, max_results: int=200) -> pd.DataFrame:
         fields = fields or [
             "key", "summary", "status", "assignee", "priority", "updated",
-            "issuetype", "duedate",
+            "issuetype", "duedate", 
+            "customfield_34841",  # Test Area
+            "customfield_34940",  # Technology
+            "customfield_34442"   # Compiler
         ]
         url = f"{self.cfg.jira_base_url}/rest/api/2/search"
         all_issues = []
@@ -123,6 +126,9 @@ class JiraClient:
                 "updated": f.get("updated"),
                 "issue_type": (f.get("issuetype") or {}).get("name"),
                 "due_date": f.get("duedate"),
+                "test_area": jira_field_value(f.get("customfield_34841")),
+                "technology": jira_field_value(f.get("customfield_34940")),
+                "compiler": jira_field_value(f.get("customfield_34442")),
             })
         return pd.DataFrame(rows)
 
@@ -242,6 +248,27 @@ class JiraClient:
         if not tests:
             log.warning("Xray returned no test cases for Test Execution %s", execution_key)
         return tests
+
+def jira_field_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        return ", ".join(
+            str(jira_field_value(item))
+            for item in value
+            if jira_field_value(item) is not None
+        )
+
+    if isinstance(value, dict):
+        return (
+            value.get("value")
+            or value.get("name")
+            or value.get("displayName")
+            or value.get("key")
+        )
+
+    return value
 
 def extract_static_tables(storage_html: str) -> list[pd.DataFrame]:
     soup = BeautifulSoup(storage_html, "lxml")
