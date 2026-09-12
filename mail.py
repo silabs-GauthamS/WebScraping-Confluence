@@ -1,6 +1,5 @@
 import csv
 import re
-from collections import defaultdict
 from datetime import date
 from html import escape
 from pathlib import Path
@@ -11,8 +10,6 @@ import win32com.client
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 OUTPUT_DIR = SCRIPT_DIR / "confluence_output"
-if not OUTPUT_DIR.exists():
-    OUTPUT_DIR = SCRIPT_DIR / "confluence_ouput"
 
 RECIPIENTS = [
     # "VenkataRamanaKumar.Rajanala@silabs.com",
@@ -174,23 +171,23 @@ def execution_table(rows, metadata, include_board):
     )
 
 
-def jira_table(execution_rows):
-    """Build one Jira row per defect key referenced by the execution CSV."""
-    compilers_by_defect = defaultdict(set)
-    for row in execution_rows:
-        for key in (row.get("defects") or "").split(","):
-            key = key.strip()
-            if key and row.get("compiler"):
-                compilers_by_defect[key].add(row["compiler"].strip())
-
-    # Missing values: test_executions.csv only contains defect keys. Defect
-    # Summary, Status, Priority and IsRegressionIssue are not present in any
-    # supplied CSV, so those cells remain "-" until Jira defect data is exported.
+def jira_table(jira_rows):
+    """Build the Jira table from confluence_output/jira_details.csv."""
     headings = ["Issue key", "Compiler", "Summary", "Status", "Priority", "IsRegressionIssue"]
     body_rows = []
-    for key in sorted(compilers_by_defect):
+    for row in jira_rows:
+        key = (row.get("issue_key") or "").strip()
+        if not key:
+            continue
         link = f'<a href="https://jira.silabs.com/browse/{escape(key)}">{escape(key)}</a>'
-        values = [link, safe(", ".join(sorted(compilers_by_defect[key]))), "-", "-", "-", "-"]
+        values = [
+            link,
+            safe(row.get("compiler")),
+            safe(row.get("summary")),
+            safe(row.get("status")),
+            safe(row.get("priority")),
+            safe(row.get("is_regression_issue")),
+        ]
         body_rows.append(
             "<tr>" + "".join(f'<td style="{CELL_STYLE}">{value}</td>' for value in values) + "</tr>"
         )
@@ -206,14 +203,12 @@ def jira_table(execution_rows):
     )
 
 
-def build_report_html(soc_rows, ncp_rows, soc_metadata, ncp_metadata):
+def build_report_html(soc_rows, ncp_rows, jira_rows, soc_metadata, ncp_metadata):
     detail_rows = "".join(
         f'<tr><th style="{CELL_STYLE}background:#f3f6f9;text-align:left;">{escape(label)}</th>'
         f'<td style="{CELL_STYLE}">{escape(value)}</td></tr>'
         for label, value in BUILD_DETAILS.items()
     )
-    all_rows = soc_rows + ncp_rows
-
     return f"""<!DOCTYPE html>
 <html>
 <body style="margin:0;padding:20px;background:#f4f6f8;color:#172b4d;font-family:Arial,sans-serif;font-size:14px;">
@@ -222,9 +217,6 @@ def build_report_html(soc_rows, ncp_rows, soc_metadata, ncp_metadata):
     <p>Please find the below complete Execution status of <strong>{escape(BUILD_NAME)}</strong>
        build [{escape(REPORT_PERIOD)}].</p>
 
-    <h2 style="font-size:17px;color:#0052cc;margin:24px 0 10px;">Build Details:</h2>
-    <table role="presentation" style="border-collapse:collapse;min-width:560px;">{detail_rows}</table>
-
     <h2 style="font-size:17px;color:#0052cc;margin:28px 0 10px;">SoC Execution Update:</h2>
     {execution_table(soc_rows, soc_metadata, include_board=True)}
 
@@ -232,7 +224,7 @@ def build_report_html(soc_rows, ncp_rows, soc_metadata, ncp_metadata):
     {execution_table(ncp_rows, ncp_metadata, include_board=False)}
 
     <h2 style="font-size:17px;color:#0052cc;margin:28px 0 10px;">Jira Details:</h2>
-    {jira_table(all_rows)}
+    {jira_table(jira_rows)}
 
     <h2 style="font-size:17px;color:#0052cc;margin:28px 0 10px;">X-Ray Rail Link:</h2>
     <p><a href="{escape(XRAY_RAIL_LINK)}"><strong>{escape(XRAY_RAIL_LINK)}</strong></a></p>
@@ -250,6 +242,7 @@ def main():
         for row in read_csv(OUTPUT_DIR / "test_executions.csv")
         if is_visible_execution(row)
     ]
+    jira_rows = read_csv(OUTPUT_DIR / "jira_details.csv")
 
     soc_rows = [row for row in execution_rows if row.get("test_plan_key") in soc_metadata]
     ncp_rows = [row for row in execution_rows if row.get("test_plan_key") in ncp_metadata]
@@ -258,7 +251,9 @@ def main():
     mail.To = "; ".join(RECIPIENTS)
     mail.CC = "; ".join(CC_RECIPIENTS)
     mail.Subject = f"Weekly Test Report - {BUILD_NAME} - {date.today():%d %b %Y}"
-    mail.HTMLBody = build_report_html(soc_rows, ncp_rows, soc_metadata, ncp_metadata)
+    mail.HTMLBody = build_report_html(
+        soc_rows, ncp_rows, jira_rows, soc_metadata, ncp_metadata
+    )
     mail.Display()
 
 

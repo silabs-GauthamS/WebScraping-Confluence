@@ -21,6 +21,7 @@ log = logging.getLogger("confluence_scraper")
 
 TESTCASE_TECHNOLOGY_FIELD = "customfield_22640"
 TESTCASE_TEST_AREA_FIELD = "customfield_33578"
+TESTCASE_TYPE_FIELD = "customfield_33354"
 
 class Config:
     def __init__(self):
@@ -150,7 +151,11 @@ class JiraClient:
                 "jql": f"key in ({quoted_keys})",
                 "startAt": 0,
                 "maxResults": len(key_batch),
-                "fields": [TESTCASE_TEST_AREA_FIELD, TESTCASE_TECHNOLOGY_FIELD],
+                "fields": [
+                    TESTCASE_TEST_AREA_FIELD,
+                    TESTCASE_TECHNOLOGY_FIELD,
+                    TESTCASE_TYPE_FIELD,
+                ],
             }
             url = f"{self.cfg.jira_base_url}/rest/api/2/search"
             resp = self.session.post(url, json=payload, timeout=30)
@@ -166,6 +171,7 @@ class JiraClient:
                 metadata[issue_key] = {
                     "test_area": fields.get(TESTCASE_TEST_AREA_FIELD),
                     "technology": fields.get(TESTCASE_TECHNOLOGY_FIELD),
+                    "test_case_type": fields.get(TESTCASE_TYPE_FIELD),
                 }
 
         return metadata
@@ -453,7 +459,12 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
         fields = testcase_metadata.get(test_key, {})
         if (
             jira_field_has_exact_value(fields.get("technology"), FILTER_TECHNOLOGY)
-            and jira_field_has_exact_value(fields.get("test_area"), FILTER_TEST_AREA)
+            and (
+                jira_field_has_exact_value(fields.get("test_area"), FILTER_TEST_AREA)
+                or jira_field_has_exact_value(
+                    fields.get("test_case_type"), FILTER_TEST_AREA
+                )
+            )
         ):
             filtered_tests.append(test)
 
@@ -463,6 +474,7 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
                 "key": key,
                 "technology": JiraClient._value(fields.get("technology")),
                 "test_area": JiraClient._value(fields.get("test_area")),
+                "test_case_type": JiraClient._value(fields.get("test_case_type")),
             }
             for key, fields in list(testcase_metadata.items())[:10]
         ]
@@ -474,11 +486,12 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
 
     log.info(
         "Test Execution %s: retained %s of %s testcases after testcase-level "
-        "Technology=%s and Test Area=%s filtering",
+        "Technology=%s and (Test Area=%s or Test Case Type=%s) filtering",
         execution_key,
         len(filtered_tests),
         len(tests),
         FILTER_TECHNOLOGY,
+        FILTER_TEST_AREA,
         FILTER_TEST_AREA,
     )
     counts = Counter()
