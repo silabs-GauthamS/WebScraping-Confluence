@@ -13,6 +13,7 @@ else {
 }
 $activateScript = Join-Path $venvPath "Scripts\Activate.ps1"
 $confluenceScript = Join-Path $scriptDirectory "accessing_confluence.py"
+$jiraDetails = Join-Path $scriptDirectory "jira_details.py"
 $mailScript = Join-Path $scriptDirectory "mail.py"
 
 if (-not (Test-Path -LiteralPath $activateScript -PathType Leaf)) {
@@ -36,13 +37,19 @@ try {
         throw "accessing_confluence.py failed with exit code $LASTEXITCODE. mail.py was not run."
     }
 
+    Write-Host "Running jira_details.py..."
+    & python $jiraDetails
+    if ($LASTEXITCODE -ne 0) {
+        throw "jira_details.py failed with exit code $LASTEXITCODE."
+    }
+
     Write-Host "Running mail.py..."
     & python $mailScript
     if ($LASTEXITCODE -ne 0) {
         throw "mail.py failed with exit code $LASTEXITCODE."
     }
 
-    Write-Host "Both scripts completed successfully."
+    Write-Host "All scripts completed successfully."
 }
 finally {
     Pop-Location
