@@ -1,5 +1,6 @@
 import csv
 import re
+import time
 from datetime import date
 from html import escape
 from pathlib import Path
@@ -247,14 +248,18 @@ def main():
     soc_rows = [row for row in execution_rows if row.get("test_plan_key") in soc_metadata]
     ncp_rows = [row for row in execution_rows if row.get("test_plan_key") in ncp_metadata]
 
-    mail = win32com.client.Dispatch("Outlook.Application").CreateItem(0)
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+    
+    mail = outlook.CreateItem(0)
     mail.To = "; ".join(RECIPIENTS)
     mail.CC = "; ".join(CC_RECIPIENTS)
     mail.Subject = f"Weekly Test Report - {BUILD_NAME} - {date.today():%d %b %Y}"
     mail.HTMLBody = build_report_html(
         soc_rows, ncp_rows, jira_rows, soc_metadata, ncp_metadata
     )
-    mail.Display()
+    mail.Send()
+    namespace.SendAndReceive(False)
 
 
 if __name__ == "__main__":
