@@ -16,8 +16,9 @@ OUTPUT_DIR = SCRIPT_DIR / "confluence_output"
 
 RECIPIENTS = [
     # "VenkataRamanaKumar.Rajanala@silabs.com",
-    "Gautham.Sharma@silabs.com",
-    # "adithyaa.a@silabs.com"
+    # "Gautham.Sharma@silabs.com",
+    # "adithyaa.a@silabs.com",
+    "Bhargavi.Chimata@silabs.com",
 ]
 CC_RECIPIENTS = []
 
