@@ -20,7 +20,7 @@ if (-not (Test-Path -LiteralPath $activateScript -PathType Leaf)) {
     throw "Virtual environment activation script not found: $activateScript"
 }
 
-foreach ($scriptPath in @($confluenceScript, $mailScript)) {
+foreach ($scriptPath in @($confluenceScript, $jiraDetails, $mailScript)) {
     if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
         throw "Required Python script not found: $scriptPath"
     }

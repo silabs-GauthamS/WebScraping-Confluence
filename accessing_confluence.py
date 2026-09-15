@@ -6,11 +6,18 @@ import os
 import sys
 import logging
 import re
-import time
+
 import requests
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 import pandas as pd
+
+from jira_client import (
+    JiraClient,
+    XrayError,
+    field_value,
+    jira_field_has_exact_value,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,9 +26,6 @@ logging.basicConfig(
 
 log = logging.getLogger("confluence_scraper")
 
-TESTCASE_TECHNOLOGY_FIELD = "customfield_22640"
-TESTCASE_TEST_AREA_FIELD = "customfield_33578"
-TESTCASE_TYPE_FIELD = "customfield_33354"
 
 class Config:
     def __init__(self):
@@ -31,6 +35,8 @@ class Config:
         self.jira_base_url = os.getenv("JIRA_BASE_URL", self.confluence_base_url).rstrip("/")
         self.jira_token = os.getenv("JIRA_TOKEN", self.confluence_token)
         self.page_id = os.getenv("CONFLUENCE_PAGE_ID")
+        self.filter_technology = os.getenv("TECHNOLOGY", "WLAN")
+        self.filter_test_area = os.getenv("TEST_AREA", "FUNCTIONAL")
         try:
             self.xray_page_size = max(10, int(os.getenv("XRAY_PAGE_SIZE", "50")))
             self.xray_timeout_seconds = max(30, int(os.getenv("XRAY_TIMEOUT_SECONDS", "90")))
@@ -47,12 +53,17 @@ class Config:
             self.xray_workers = 5
 
     @staticmethod
-    def _require(key:str) -> str:
+    def _require(key: str) -> str:
         val = os.getenv(key)
         if not val:
             log.error(f"Missing required env val: {key}")
             sys.exit(1)
         return val
+
+
+def make_jira_client(cfg: Config) -> JiraClient:
+    return JiraClient(cfg.jira_base_url, cfg.jira_token, xray_cfg=cfg)
+
 
 class ConfluenceClient:
     def __init__(self, cfg: Config):
@@ -65,7 +76,7 @@ class ConfluenceClient:
 
     def get_page_storage_html(self, page_id: str) -> str:
         url = f"{self.cfg.confluence_base_url}/rest/api/content/{page_id}"
-        params = {"expand":"body.storage,version,title"}
+        params = {"expand": "body.storage,version,title"}
         resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -76,299 +87,6 @@ class ConfluenceClient:
             data.get("version", {}).get("number"),
         )
         return data["body"]["storage"]["value"]
-
-
-class XrayError(RuntimeError):
-    """Raised when an Xray page cannot be retrieved completely."""
-
-
-class JiraClient:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {cfg.jira_token}",
-            "Accept": "application/json",
-        })
-
-    def search(self, jql: str, fields=None, max_results: int=200) -> pd.DataFrame:
-        fields = fields or [
-            "key", "summary", "status", "assignee", "priority", "updated",
-            "issuetype", "duedate", 
-            "customfield_34841",  # Test Area
-            "customfield_34940",  # Technology
-            "customfield_34442",  # Compiler
-        ]
-        url = f"{self.cfg.jira_base_url}/rest/api/2/search"
-        all_issues = []
-        start_at = 0
-
-        while True:
-            payload = {
-                "jql": jql,
-                "startAt": start_at,
-                "maxResults": max_results,
-                "fields": fields
-            }
-
-            resp = self.session.post(url, json=payload, timeout=30)
-            if not resp.ok:
-                log.warning(f"Jira search failed {resp.status_code}: {resp.text[:300]}")
-                return pd.DataFrame()
-
-            data=resp.json()
-            all_issues.extend(data.get("issues", []))
-            total = data.get("total", 0)
-            start_at += len(data.get("issues", []))
-            if start_at >= total or not data.get("issues"):
-                break
-
-        rows = []
-        for issue in all_issues:
-            f = issue.get("fields", {})
-            rows.append({
-                "key": issue.get("key"),
-                "summary": f.get("summary"),
-                "status": (f.get("status") or {}).get("name"),
-                "assignee": (f.get("assignee") or {}).get("displayName"),
-                "priority": (f.get("priority") or {}).get("name"),
-                "updated": f.get("updated"),
-                "issue_type": (f.get("issuetype") or {}).get("name"),
-                "due_date": f.get("duedate"),
-                "test_area": jira_field_value(f.get("customfield_34841")),
-                "technology": jira_field_value(f.get("customfield_34940")),
-                "compiler": jira_field_value(f.get("customfield_34442")),
-            })
-        return pd.DataFrame(rows)
-
-    def get_testcase_filter_fields(self, test_keys: list[str]) -> dict[str, dict]:
-        """Return raw Technology and Test Area values for the requested Test issues."""
-        metadata = {}
-        unique_keys = list(dict.fromkeys(key for key in test_keys if key))
-
-        # Keep each JQL request reasonably small while still using Jira pagination.
-        for offset in range(0, len(unique_keys), 100):
-            key_batch = unique_keys[offset:offset + 100]
-            quoted_keys = ", ".join(f'"{key}"' for key in key_batch)
-            payload = {
-                "jql": f"key in ({quoted_keys})",
-                "startAt": 0,
-                "maxResults": len(key_batch),
-                "fields": [
-                    TESTCASE_TEST_AREA_FIELD,
-                    TESTCASE_TECHNOLOGY_FIELD,
-                    TESTCASE_TYPE_FIELD,
-                ],
-            }
-            url = f"{self.cfg.jira_base_url}/rest/api/2/search"
-            resp = self.session.post(url, json=payload, timeout=30)
-            if not resp.ok:
-                raise XrayError(
-                    "Could not retrieve testcase Technology/Test Area fields: "
-                    f"HTTP {resp.status_code}: {resp.text[:300]}"
-                )
-
-            for issue in resp.json().get("issues", []):
-                fields = issue.get("fields", {})
-                issue_key = str(issue.get("key") or "").strip().upper()
-                metadata[issue_key] = {
-                    "test_area": fields.get(TESTCASE_TEST_AREA_FIELD),
-                    "technology": fields.get(TESTCASE_TECHNOLOGY_FIELD),
-                    "test_case_type": fields.get(TESTCASE_TYPE_FIELD),
-                }
-
-        return metadata
-
-    def get_active_issue_keys(self, issue_keys: list[str]) -> set[str]:
-        """Return issues whose Jira status category is not Done."""
-        active_keys = set()
-        unique_keys = list(dict.fromkeys(key for key in issue_keys if key))
-
-        for offset in range(0, len(unique_keys), 100):
-            key_batch = unique_keys[offset:offset + 100]
-            quoted_keys = ", ".join(f'"{key}"' for key in key_batch)
-            payload = {
-                "jql": (
-                    f"key in ({quoted_keys}) "
-                    'AND statusCategory != "Done"'
-                ),
-                "startAt": 0,
-                "maxResults": len(key_batch),
-                "fields": ["key"],
-            }
-            url = f"{self.cfg.jira_base_url}/rest/api/2/search"
-            resp = self.session.post(url, json=payload, timeout=30)
-            if not resp.ok:
-                raise XrayError(
-                    "Could not retrieve defect statuses: "
-                    f"HTTP {resp.status_code}: {resp.text[:300]}"
-                )
-
-            active_keys.update(
-                str(issue.get("key") or "").strip().upper()
-                for issue in resp.json().get("issues", [])
-                if issue.get("key")
-            )
-
-        return active_keys
-
-    def _xray_get(self, path: str, params: dict | None = None):
-        """GET an Xray Server/Data Center REST resource using the Jira PAT."""
-        url = f"{self.cfg.jira_base_url}/rest/raven/latest/api/{path.lstrip('/')}"
-        retryable_statuses = {429, 500, 502, 503, 504}
-
-        for attempt in range(self.cfg.xray_retry_count + 1):
-            try:
-                resp = self.session.get(
-                    url,
-                    params=params,
-                    timeout=(10, self.cfg.xray_timeout_seconds),
-                )
-            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
-                if attempt >= self.cfg.xray_retry_count:
-                    raise XrayError(
-                        f"Xray request failed after {attempt + 1} attempts: {path}: {exc}"
-                    ) from exc
-                delay = 2 ** attempt
-                log.warning("Xray request error for %s; retrying in %ss", path, delay)
-                time.sleep(delay)
-                continue
-
-            if resp.ok:
-                try:
-                    return resp.json()
-                except ValueError as exc:
-                    raise XrayError(f"Xray returned non-JSON data for {path}") from exc
-
-            if resp.status_code in retryable_statuses and attempt < self.cfg.xray_retry_count:
-                retry_after = resp.headers.get("Retry-After")
-                try:
-                    delay = min(30, max(1, int(retry_after)))
-                except (TypeError, ValueError):
-                    delay = 2 ** attempt
-                log.warning(
-                    "Xray returned HTTP %s for %s; retrying in %ss",
-                    resp.status_code,
-                    path,
-                    delay,
-                )
-                time.sleep(delay)
-                continue
-
-            raise XrayError(
-                f"Xray request failed HTTP {resp.status_code} for {path}: {resp.text[:300]}"
-            )
-
-    @staticmethod
-    def _items_from_xray_response(data) -> list[dict]:
-        """Accept the list/objects used by different Xray API versions."""
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        if isinstance(data, dict):
-            for key in ("tests", "results", "values", "items"):
-                if isinstance(data.get(key), list):
-                    return [item for item in data[key] if isinstance(item, dict)]
-        return []
-
-    @staticmethod
-    def _value(value):
-        """Make an Xray/Jira value suitable for one CSV cell."""
-        if value is None:
-            return None
-        if isinstance(value, dict):
-            for key in ("name", "value", "key", "displayName"):
-                if value.get(key) is not None:
-                    return value[key]
-            return json.dumps(value, ensure_ascii=False)
-        if isinstance(value, list):
-            return ", ".join(str(JiraClient._value(item)) for item in value)
-        return value
-
-    def get_xray_execution_tests(self, execution_key: str) -> list[dict]:
-        page_size = self.cfg.xray_page_size
-        page = 1
-        tests = []
-        seen_ids = set()
-
-        while True:
-            data = self._xray_get(
-                f"testexec/{execution_key}/test",
-                params={"detailed": "true", "page": page, "limit": page_size},
-            )
-            page_items = self._items_from_xray_response(data)
-            for item in page_items:
-                identity = item.get("id") or (item.get("key"), item.get("rank"))
-                if identity not in seen_ids:
-                    seen_ids.add(identity)
-                    tests.append(item)
-
-            total = data.get("total") if isinstance(data, dict) else None
-            try:
-                total = int(total) if total is not None else None
-            except (TypeError, ValueError):
-                total = None
-
-            log.info(
-                "Fetched Xray page %s for %s: %s records (%s collected%s)",
-                page,
-                execution_key,
-                len(page_items),
-                len(tests),
-                f"/{total}" if total is not None else "",
-            )
-
-            if not page_items or len(page_items) < page_size:
-                break
-            if total is not None and len(tests) >= total:
-                break
-            page += 1
-
-        if not tests:
-            log.warning("Xray returned no test cases for Test Execution %s", execution_key)
-        return tests
-
-def extract_jira_option_values(value) -> list:
-    """Extract individual option values from a Jira field."""
-    if value is None:
-        return []
-
-    if isinstance(value, list):
-        values = []
-        for item in value:
-            values.extend(extract_jira_option_values(item))
-        return values
-
-    if isinstance(value, dict):
-        option = (
-            value.get("value")
-            or value.get("name")
-            or value.get("displayName")
-            or value.get("key")
-        )
-        return extract_jira_option_values(option)
-
-    return [value]
-
-
-def jira_field_value(value):
-    """Convert a Jira field into a value suitable for a CSV cell."""
-    values = extract_jira_option_values(value)
-
-    if not values:
-        return None
-
-    return ", ".join(str(item) for item in values)
-
-
-def jira_field_has_exact_value(value, expected: str) -> bool:
-    """Check whether a Jira field contains an exact option."""
-    expected = expected.strip().casefold()
-
-    return any(
-        option.strip().casefold() == expected
-        for value in extract_jira_option_values(value)
-        for option in re.split(r"[,;]", str(value))
-    )
 
 
 def xray_test_key(test: dict) -> str | None:
@@ -385,6 +103,7 @@ def xray_test_key(test: dict) -> str | None:
                     return str(nested[key_field]).strip().upper()
     return None
 
+
 def extract_static_tables(storage_html: str) -> list[pd.DataFrame]:
     soup = BeautifulSoup(storage_html, "lxml")
     tables = []
@@ -396,6 +115,7 @@ def extract_static_tables(storage_html: str) -> list[pd.DataFrame]:
             continue
     log.info(f"Found {len(tables)} static table(s) in storage format")
     return tables
+
 
 JIRA_KEY_PATTERN = re.compile(r"\b[A-Z][A-Z0-9_]*-\d{5}\b", re.IGNORECASE)
 
@@ -458,11 +178,8 @@ STATUS_COLUMN_MAP = {
     "N/A": "not_applicable",
 }
 
-FILTER_TECHNOLOGY = os.getenv("TECHNOLOGY", "WLAN")
-FILTER_TEST_AREA = os.getenv("TEST_AREA","FUNCTIONAL")
 
-
-def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
+def build_xray_execution_summary(jira: JiraClient, execution_key: str, cfg: Config) -> dict:
     """Aggregate matching WLAN/Functionality testcases into one execution summary."""
     tests = jira.get_xray_execution_tests(execution_key)
     test_keys = [key for test in tests if (key := xray_test_key(test))]
@@ -493,31 +210,15 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
         test_key = xray_test_key(test)
         fields = testcase_metadata.get(test_key, {})
         if (
-            jira_field_has_exact_value(fields.get("technology"), FILTER_TECHNOLOGY)
+            jira_field_has_exact_value(fields.get("technology"), cfg.filter_technology)
             and (
-                jira_field_has_exact_value(fields.get("test_area"), FILTER_TEST_AREA)
+                jira_field_has_exact_value(fields.get("test_area"), cfg.filter_test_area)
                 or jira_field_has_exact_value(
-                    fields.get("test_case_type"), FILTER_TEST_AREA
+                    fields.get("test_case_type"), cfg.filter_test_area
                 )
             )
         ):
             filtered_tests.append(test)
-
-    # if tests and not filtered_tests and testcase_metadata:
-    #     observed_values = [
-    #         {
-    #             "key": key,
-    #             "technology": JiraClient._value(fields.get("technology")),
-    #             "test_area": JiraClient._value(fields.get("test_area")),
-    #             "test_case_type": JiraClient._value(fields.get("test_case_type")),
-    #         }
-    #         for key, fields in list(testcase_metadata.items())[:10]
-    #     ]
-    #     log.warning(
-    #         "No testcase matched the filter for %s. Sample Jira field values: %s",
-    #         execution_key,
-    #         json.dumps(observed_values, default=str),
-    #     )
 
     log.info(
         "Test Execution %s: retained %s of %s testcases after testcase-level "
@@ -525,15 +226,15 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
         execution_key,
         len(filtered_tests),
         len(tests),
-        FILTER_TECHNOLOGY,
-        FILTER_TEST_AREA,
-        FILTER_TEST_AREA,
+        cfg.filter_technology,
+        cfg.filter_test_area,
+        cfg.filter_test_area,
     )
     counts = Counter()
     defects = set()
 
     for test in filtered_tests:
-        status = str(JiraClient._value(test.get("status")) or "Unknown").strip()
+        status = str(field_value(test.get("status"), empty="Unknown") or "Unknown").strip()
         counts[status] += 1
 
         for defect in test.get("defects") or []:
@@ -554,9 +255,7 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
         "untriaged": 0,
         "blocked": 0,
         "not_applicable": 0,
-        "defect_count": len(defects),
         "defects": ", ".join(sorted(defects)),
-        "xray_status_counts": json.dumps(dict(sorted(counts.items()))),
     }
     for status, count in counts.items():
         column = STATUS_COLUMN_MAP.get(status.upper())
@@ -567,11 +266,9 @@ def build_xray_execution_summary(jira: JiraClient, execution_key: str) -> dict:
 
 def build_execution_summary_worker(cfg: Config, execution_key: str) -> dict:
     """Build one execution summary using a session owned by this worker."""
-    jira = JiraClient(cfg)
+    jira = make_jira_client(cfg)
     try:
-        summary = build_xray_execution_summary(jira, execution_key)
-        summary["xray_fetch_error"] = None
-        return summary
+        return build_xray_execution_summary(jira, execution_key, cfg)
     except XrayError as exc:
         log.error("Could not build Xray summary for %s: %s", execution_key, exc)
         return {
@@ -584,10 +281,7 @@ def build_execution_summary_worker(cfg: Config, execution_key: str) -> dict:
             "untriaged": None,
             "blocked": None,
             "not_applicable": None,
-            "defect_count": None,
             "defects": None,
-            "xray_status_counts": None,
-            "xray_fetch_error": str(exc),
         }
     finally:
         jira.session.close()
@@ -622,6 +316,7 @@ def add_xray_execution_summaries(
 
     return test_executions.merge(pd.DataFrame(summaries), on="key", how="left")
 
+
 def main():
     cfg = Config()
     page_id = cfg.page_id
@@ -633,7 +328,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     confluence = ConfluenceClient(cfg)
-    jira = JiraClient(cfg)
+    jira = make_jira_client(cfg)
 
     storage_html = confluence.get_page_storage_html(page_id)
 
@@ -657,6 +352,7 @@ def main():
 
     if not static_tables:
         log.warning("No Confluence tables were found")
+
 
 if __name__ == "__main__":
     main()

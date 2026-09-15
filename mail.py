@@ -1,13 +1,15 @@
 import csv
+import os
 import re
 import time
+from dotenv import load_dotenv
 from datetime import date
 from html import escape
 from pathlib import Path
 
 import win32com.client
 
-
+load_dotenv()
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 OUTPUT_DIR = SCRIPT_DIR / "confluence_output"
@@ -15,18 +17,13 @@ OUTPUT_DIR = SCRIPT_DIR / "confluence_output"
 RECIPIENTS = [
     # "VenkataRamanaKumar.Rajanala@silabs.com",
     "Gautham.Sharma@silabs.com",
+    # "adithyaa.a@silabs.com"
 ]
 CC_RECIPIENTS = []
 
-REPORT_PERIOD = "31st Aug to 4th Sep"
-BUILD_NAME = "WC-4.1.2-IFC1FC/IFC2FC"
-BUILD_DETAILS = {
-    "FW": "SiWG917-B.2.16.5.2.0.2, SiWG917-B.2.16.5.2.0.4",
-    "Encryption": "Encrypted",
-    "Card used": "SOC-4338A A14 and NCP-4346A A13",
-    "Monolithic": "Received on 19th Aug (sisdk-2026.6/2843/), 2851",
-}
-XRAY_RAIL_LINK = "https://confluence.silabs.com/spaces/EN/pages/887398550/WC_4.1.2"
+PAGE_ID = os.getenv("CONFLUENCE_PAGE_ID")
+TITLE = os.getenv("CONFLUENCE_PAGE_TITLE")
+XRAY_RAIL_LINK = f"https://confluence.silabs.com/spaces/EN/pages/{PAGE_ID}/{TITLE}"
 
 
 CELL_STYLE = "border:1px solid #c9d1d9;padding:7px 8px;vertical-align:top;"
@@ -72,32 +69,21 @@ def plan_metadata(static_rows):
     return metadata
 
 
-def execution_parts(summary, compiler):
-    """Extract the displayed test-plan name and board from an execution summary."""
+def execution_parts(summary):
+    """Extract the test-plan name and board from a standardized execution summary."""
     text = (summary or "").strip()
     tail = text.split("-917-", 1)[-1] if "-917-" in text else text
-    compiler_tokens = [
-        "GCC_LTO_PSRAM",
-        "LLVM_LTO_PSRAM",
-        "GCC_LTO",
-        "LLVM_LTO",
-        "GCC_PSRAM",
-        "LLVM_PSRAM",
-        "GCC",
-        "LLVM",
-    ]
-    match = re.match(
-        rf"(?P<test_plan>.+?)-(?:{'|'.join(compiler_tokens)})-(?P<board>.+)$",
-        tail,
-        re.IGNORECASE,
-    )
-    if not match:
+
+    parts = tail.rsplit("-", 2)
+    if len(parts) != 3:
         return text or "-", "-"
 
-    test_plan = match.group("test_plan").strip()
-    if test_plan == "smoke_tests":
+    test_plan, _, board = parts
+
+    if test_plan.casefold() == "smoke_tests":
         test_plan = "SANITY_TESTPLAN"
-    return test_plan, match.group("board").strip()
+
+    return test_plan.strip(), board.strip()
 
 
 def defects_html(defects):
@@ -139,7 +125,7 @@ def execution_table(rows, metadata, include_board):
 
     body_rows = []
     for row in rows:
-        test_plan, board = execution_parts(row.get("summary"), row.get("compiler"))
+        test_plan, board = execution_parts(row.get("summary"))
         values = [safe(test_plan)]
         if include_board:
             values.append(safe(board))
@@ -205,18 +191,12 @@ def jira_table(jira_rows):
 
 
 def build_report_html(soc_rows, ncp_rows, jira_rows, soc_metadata, ncp_metadata):
-    detail_rows = "".join(
-        f'<tr><th style="{CELL_STYLE}background:#f3f6f9;text-align:left;">{escape(label)}</th>'
-        f'<td style="{CELL_STYLE}">{escape(value)}</td></tr>'
-        for label, value in BUILD_DETAILS.items()
-    )
     return f"""<!DOCTYPE html>
 <html>
 <body style="margin:0;padding:20px;background:#f4f6f8;color:#172b4d;font-family:Arial,sans-serif;font-size:14px;">
   <div style="max-width:1400px;margin:auto;border:1px solid #dfe1e6;padding:24px;">
     <p>Hi Everyone,</p>
-    <p>Please find the below complete Execution status of <strong>{escape(BUILD_NAME)}</strong>
-       build [{escape(REPORT_PERIOD)}].</p>
+    <p>Please find the below complete Execution status of <strong>{TITLE}</strong>.</p>
 
     <h2 style="font-size:17px;color:#0052cc;margin:28px 0 10px;">SoC Execution Update:</h2>
     {execution_table(soc_rows, soc_metadata, include_board=True)}
@@ -254,12 +234,13 @@ def main():
     mail = outlook.CreateItem(0)
     mail.To = "; ".join(RECIPIENTS)
     mail.CC = "; ".join(CC_RECIPIENTS)
-    mail.Subject = f"Weekly Test Report - {BUILD_NAME} - {date.today():%d %b %Y}"
+    mail.Subject = f"Weekly Test Report - {TITLE} - {date.today():%d %b %Y}"
     mail.HTMLBody = build_report_html(
         soc_rows, ncp_rows, jira_rows, soc_metadata, ncp_metadata
     )
     mail.Send()
     namespace.SendAndReceive(False)
+    time.sleep(15)
 
 
 if __name__ == "__main__":
