@@ -14,12 +14,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 OUTPUT_DIR = SCRIPT_DIR / "confluence_output"
 
-RECIPIENTS = [
-    # "VenkataRamanaKumar.Rajanala@silabs.com",
-    "Gautham.Sharma@silabs.com",
-    # "adithyaa.a@silabs.com",
-]
-CC_RECIPIENTS = []
+RECIPIENTS = [os.getenv("RECIPIENT_EMAILS", "").split(",")]
+CC_RECIPIENTS = [os.getenv("CC_EMAILS", "").split(",")]
 
 PAGE_ID = os.getenv("CONFLUENCE_PAGE_ID")
 TITLE = os.getenv("CONFLUENCE_PAGE_TITLE")
